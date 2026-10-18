@@ -3,7 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<title>Chess Handicap</title>
+<title>Blitz Odds</title>
+<meta name="description" content="Real-time multiplayer chess with time handicap">
+<meta name="theme-color" content="#759900">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#161512;color:#bab9b8;font-family:system-ui,sans-serif;min-height:100svh;touch-action:manipulation}
@@ -37,8 +42,11 @@ button{cursor:pointer;font-family:inherit}
 <script type="module">
 import{initializeApp}from'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
 import{getDatabase,ref,set,get,push,onValue}from'https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js';
+import{getAuth,createUserWithEmailAndPassword,signInWithEmailAndPassword,sendPasswordResetEmail,onAuthStateChanged,signOut}from'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
 const FB={apiKey:"AIzaSyA9tbhMghPaZl9oYIZq8XB9gn_dwJpE9p4",authDomain:"sah-handicap-timp.firebaseapp.com",databaseURL:"https://sah-handicap-timp-default-rtdb.europe-west1.firebasedatabase.app",projectId:"sah-handicap-timp",storageBucket:"sah-handicap-timp.firebasestorage.app",messagingSenderId:"743890211052",appId:"1:743890211052:web:0fceec9669dcb4fe2855c9"};
-const db=getDatabase(initializeApp(FB));
+const fbApp=initializeApp(FB);
+const db=getDatabase(fbApp);
+const auth=getAuth(fbApp);
 const R=p=>ref(db,p);
 const fSet=(p,v)=>set(R(p),v);
 const fGet=async p=>{try{const s=await get(R(p));return s.exists()?s.val():null}catch{return null}};
@@ -69,11 +77,26 @@ function ft(ms){if(ms<=0)return'0.0';if(ms<15000){const s=Math.floor(ms/1000),d=
 const timeAgo=ts=>{const d=Math.floor((Date.now()-ts)/1000);if(d<60)return`${d}s`;if(d<3600)return`${Math.floor(d/60)}m`;if(d<86400)return`${Math.floor(d/3600)}h`;return`${Math.floor(d/86400)}d`;};
 const h2hKey=(a,b)=>[a,b].sort().join('__');
 
-/* ═══ SESSION ═══ */
-const saveSession=(u,p)=>{try{localStorage.setItem('chsess',JSON.stringify({u,p}));}catch{}};
-const loadSession=()=>{try{const s=localStorage.getItem('chsess');return s?JSON.parse(s):null;}catch{return null;}};
-const clearSession=()=>{try{localStorage.removeItem('chsess');}catch{}};
-window.clearDB=async()=>{if(!confirm('Delete ALL Firebase data?'))return;await Promise.all(['accounts','players','presence','challenges','games','playerGames','h2h','chat'].map(k=>fSet(k,null)));clearSession();alert('Done.');location.reload();};
+/* ═══ SESSION ═══
+   Firebase Auth owns the session (persisted in localStorage by the SDK).
+   We never store a password anywhere. The old 'chsess' key is purged on sight. */
+const purgeLegacySession=()=>{try{localStorage.removeItem('chsess');}catch{}};
+const AUTH_ERR={
+  'auth/email-already-in-use':'That email is already registered. Sign in instead.',
+  'auth/invalid-email':'Invalid email address.',
+  'auth/weak-password':'Password must be at least 6 characters.',
+  'auth/missing-password':'Password required.',
+  'auth/invalid-credential':'Wrong email or password.',
+  'auth/wrong-password':'Wrong email or password.',
+  'auth/user-not-found':'Wrong email or password.',
+  'auth/too-many-requests':'Too many attempts. Wait a minute and try again.',
+  'auth/network-request-failed':'Network error. Check your connection.',
+  'auth/operation-not-allowed':'Email sign-in is not enabled for this project yet.',
+  'auth/configuration-not-found':'Authentication is not set up for this project yet.',
+  'auth/unauthorized-domain':'This domain is not authorised for sign-in.',
+  'auth/user-disabled':'This account has been disabled.'
+};
+const authErr=e=>AUTH_ERR[e?.code]||(e?.code?`Sign-in error (${e.code})`:'Something went wrong. Try again.');
 
 /* ═══ AUTO TIME ═══ */
 function calcAutoTime(eloA,eloB){const BASE=180,STEP=15,STEP_ELO=50,MIN_S=60,MAX_W=600;const diff=Math.abs(eloA-eloB),steps=Math.floor(diff/STEP_ELO);if(steps===0)return{strongerSec:BASE,weakerSec:BASE};const ph1=Math.floor((BASE-MIN_S)/STEP),s1=Math.min(steps,ph1);return{strongerSec:BASE-s1*STEP,weakerSec:Math.min(MAX_W,BASE+(steps-s1)*STEP)};}
@@ -139,9 +162,10 @@ function stopDrag(){
 
 /* ═══ STATE ═══ */
 const S={
-  screen:'auth',user:null,
-  aMode:'login',aUser:'',aEmail:'',aPass:'',aErr:'',
-  fpMode:false,fpEmail:'',fpMsg:'',
+  screen:'boot',user:null,uid:null,
+  aMode:'login',aUser:'',aEmail:'',aPass:'',aErr:'',aBusy:false,
+  fpMode:false,fpEmail:'',fpMsg:'',fpErr:'',
+  pickErr:'',
   allPlayers:{},presence:{},
   inChalls:[],outChall:null,
   challDlg:false,challTarget:'',challColor:'r',wTimeSec:180,bTimeSec:180,challH2h:null,autoTime:false,
@@ -163,7 +187,9 @@ function render(){
   const chatFocus=document.activeElement===ci;
 
   const el=document.getElementById('app');if(!el)return;
-  if(S.screen==='auth')el.innerHTML=authHtml();
+  if(S.screen==='boot')el.innerHTML=bootHtml();
+  else if(S.screen==='auth')el.innerHTML=authHtml();
+  else if(S.screen==='pickname')el.innerHTML=pickNameHtml();
   else if(S.screen==='lobby')el.innerHTML=lobbyHtml();
   else if(S.screen==='game')el.innerHTML=gameHtml();
   else if(S.screen==='spectate')el.innerHTML=spectateHtml();
@@ -216,47 +242,152 @@ function tcHtml(which,val){
   </div>`;
 }
 
-/* ═══ AUTH ═══ */
+/* ═══ AUTH (Firebase Authentication) ═══
+   Identity lives in Firebase Auth; the DB only maps uid <-> username.
+     usernames/{username} = uid   (uniqueness lock, write-once)
+     uidNames/{uid}       = username
+     players/{username}   = { uid, elo, ... }
+   The rest of the app still works with S.user = username, unchanged. */
+const NAME_RE=/^[a-z0-9_]{2,20}$/;
+const START_ELO=1000;
+
+const newPlayer=uid=>({uid,elo:START_ELO,joined:Date.now(),nationality:'',club:'',eloHistory:[{elo:START_ELO,ts:Date.now()}]});
+
+async function ensurePlayer(name,uid){
+  const p=await fGet(`players/${name}`);
+  if(!p)await fSet(`players/${name}`,newPlayer(uid));
+  else if(p.uid!==uid)await fSet(`players/${name}`,{...p,uid});
+}
+
+// Claims a username for a uid. Returns '' on success, or an error message.
+async function claimUsername(uid,name){
+  if(!NAME_RE.test(name))return'Username: 2-20 chars (a-z, 0-9, _)';
+  const owner=await fGet(`usernames/${name}`);
+  if(owner&&owner!==uid)return'That username is taken.';
+  // A rejected write is almost always the rules, not a race — don't blame the name for it.
+  const denied=e=>e?.code==='PERMISSION_DENIED'||/permission.?denied/i.test(e?.message||'');
+  try{await fSet(`usernames/${name}`,uid);}
+  catch(e){return denied(e)?'Server refused the write — database rules are not configured.':'That username is taken.';}
+  try{await fSet(`uidNames/${uid}`,name);await ensurePlayer(name,uid);}
+  catch(e){return denied(e)?'Server refused the write — database rules are not configured.':'Could not finish your profile. Try again.';}
+  return'';
+}
+
+function bootHtml(){
+  return`<div style="display:flex;justify-content:center;align-items:center;height:100svh;color:#6b6a69">Loading...</div>`;
+}
+
+function pickNameHtml(){
+  return`<div style="display:flex;justify-content:center;align-items:center;min-height:100svh;padding:1rem"><div style="background:#1f1e1d;border-radius:12px;padding:2rem;width:100%;max-width:360px;border:1px solid #2a2927">
+    <h2 style="color:#f0ede8;margin-bottom:.5rem;font-size:1.1rem">Choose your username</h2>
+    <p style="color:#6b6a69;font-size:.85rem;margin-bottom:1rem">This is the name other players will see. It cannot be changed later.</p>
+    <input type="text" id="pkn" placeholder="Username (2-20 chars)" autocapitalize="none" autocomplete="username" style="margin-bottom:10px" onkeydown="if(event.key==='Enter')W.pickName()">
+    ${S.pickErr?`<p style="color:#cc4444;font-size:.85rem;margin-bottom:10px">${esc(S.pickErr)}</p>`:''}
+    <div style="display:flex;gap:8px">
+      <button onclick="W.logout()" class="btn-o" style="flex:1">Sign out</button>
+      <button onclick="W.pickName()" class="btn-g" style="flex:2"${S.aBusy?' disabled':''}>${S.aBusy?'...':'Continue'}</button>
+    </div>
+  </div></div>`;
+}
+
 function authHtml(){
-  if(S.fpMode)return`<div style="display:flex;justify-content:center;align-items:center;min-height:100svh;padding:1rem"><div style="background:#1f1e1d;border-radius:12px;padding:2rem;width:100%;max-width:360px;border:1px solid #2a2927"><h2 style="color:#f0ede8;margin-bottom:1rem;font-size:1.1rem">🔑 Recover account</h2><p style="color:#6b6a69;font-size:.85rem;margin-bottom:1rem">Enter your email to find your username.</p><input type="email" id="fpe" placeholder="Email address" style="margin-bottom:10px" onkeydown="if(event.key==='Enter')W.fpSub()">${S.fpMsg?`<p style="color:#a8c000;font-size:.88rem;margin-bottom:10px">${esc(S.fpMsg)}</p>`:''}<div style="display:flex;gap:8px"><button onclick="W.fpBack()" class="btn-o" style="flex:1">← Back</button><button onclick="W.fpSub()" class="btn-g" style="flex:2">Find account</button></div></div></div>`;
-  return`<div style="display:flex;justify-content:center;align-items:center;min-height:100svh;padding:1rem"><div style="background:#1f1e1d;border-radius:12px;padding:2rem;width:100%;max-width:380px;border:1px solid #2a2927"><div style="text-align:center;margin-bottom:1.75rem"><div style="font-size:2.5rem;margin-bottom:.4rem">♟</div><h1 style="font-size:1.4rem;font-weight:700;color:#f0ede8">Chess Handicap</h1><p style="color:#6b6a69;font-size:.8rem;margin-top:3px">Real-time multiplayer</p></div>
-  <div style="display:flex;gap:4px;margin-bottom:1.5rem;background:#161512;border-radius:8px;padding:4px"><button onclick="W.aMode('login')" style="flex:1;padding:8px;border-radius:6px;border:none;font-weight:600;font-size:.85rem;background:${S.aMode==='login'?'#759900':'transparent'};color:${S.aMode==='login'?'#fff':'#6b6a69'}">Sign in</button><button onclick="W.aMode('register')" style="flex:1;padding:8px;border-radius:6px;border:none;font-weight:600;font-size:.85rem;background:${S.aMode==='register'?'#759900':'transparent'};color:${S.aMode==='register'?'#fff':'#6b6a69'}">Register</button></div>
+  if(S.fpMode)return`<div style="display:flex;justify-content:center;align-items:center;min-height:100svh;padding:1rem"><div style="background:#1f1e1d;border-radius:12px;padding:2rem;width:100%;max-width:360px;border:1px solid #2a2927">
+    <h2 style="color:#f0ede8;margin-bottom:.5rem;font-size:1.1rem">🔑 Reset password</h2>
+    <p style="color:#6b6a69;font-size:.85rem;margin-bottom:1rem">Enter your email and we'll send you a link to set a new password.</p>
+    <input type="email" id="fpe" placeholder="Email address" value="${esc(S.fpEmail)}" autocomplete="email" style="margin-bottom:10px" onkeydown="if(event.key==='Enter')W.fpSub()">
+    ${S.fpMsg?`<p style="color:#a8c000;font-size:.88rem;margin-bottom:10px">${esc(S.fpMsg)}</p>`:''}
+    ${S.fpErr?`<p style="color:#cc4444;font-size:.85rem;margin-bottom:10px">${esc(S.fpErr)}</p>`:''}
+    <div style="display:flex;gap:8px">
+      <button onclick="W.fpBack()" class="btn-o" style="flex:1">← Back</button>
+      <button onclick="W.fpSub()" class="btn-g" style="flex:2"${S.aBusy?' disabled':''}>${S.aBusy?'Sending...':'Send reset link'}</button>
+    </div>
+  </div></div>`;
+  const reg=S.aMode==='register';
+  return`<div style="display:flex;justify-content:center;align-items:center;min-height:100svh;padding:1rem"><div style="background:#1f1e1d;border-radius:12px;padding:2rem;width:100%;max-width:380px;border:1px solid #2a2927"><div style="text-align:center;margin-bottom:1.75rem"><div style="font-size:2.5rem;margin-bottom:.4rem">♟</div><h1 style="font-size:1.4rem;font-weight:700;color:#f0ede8">Blitz Odds</h1><p style="color:#6b6a69;font-size:.8rem;margin-top:3px">Chess with time odds</p></div>
+  <div style="display:flex;gap:4px;margin-bottom:1.5rem;background:#161512;border-radius:8px;padding:4px"><button onclick="W.aMode('login')" style="flex:1;padding:8px;border-radius:6px;border:none;font-weight:600;font-size:.85rem;background:${reg?'transparent':'#759900'};color:${reg?'#6b6a69':'#fff'}">Sign in</button><button onclick="W.aMode('register')" style="flex:1;padding:8px;border-radius:6px;border:none;font-weight:600;font-size:.85rem;background:${reg?'#759900':'transparent'};color:${reg?'#fff':'#6b6a69'}">Register</button></div>
   <div style="display:flex;flex-direction:column;gap:10px">
-    ${S.aMode==='register'?`<input type="text" id="au" placeholder="Username (2-20 chars)" value="${esc(S.aUser)}" autocapitalize="none" autocomplete="username" onkeydown="if(event.key==='Enter')W.auth()">`:``}
+    ${reg?`<input type="text" id="au" placeholder="Username (2-20 chars)" value="${esc(S.aUser)}" autocapitalize="none" autocomplete="username" onkeydown="if(event.key==='Enter')W.auth()">`:``}
     <input type="email" id="ae" placeholder="Email address" value="${esc(S.aEmail)}" autocomplete="email" onkeydown="if(event.key==='Enter')W.auth()">
-    ${S.aMode==='login'?`<input type="text" id="au" placeholder="Username" value="${esc(S.aUser)}" autocapitalize="none" autocomplete="username" onkeydown="if(event.key==='Enter')W.auth()">`:``}
-    <input type="password" id="ap" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')W.auth()">
+    <input type="password" id="ap" placeholder="${reg?'Password (min 6 chars)':'Password'}" autocomplete="${reg?'new-password':'current-password'}" onkeydown="if(event.key==='Enter')W.auth()">
     ${S.aErr?`<p style="color:#cc4444;font-size:.85rem">${esc(S.aErr)}</p>`:''}
-    <button onclick="W.auth()" class="btn-g" style="width:100%;margin-top:2px">${S.aMode==='login'?'Sign in':'Create account'}</button>
-    ${S.aMode==='login'?`<button onclick="W.fpStart()" style="background:transparent;border:none;color:#6b6a69;font-size:.82rem;text-decoration:underline;padding:2px">Forgot password?</button>`:''}
+    <button onclick="W.auth()" class="btn-g" style="width:100%;margin-top:2px"${S.aBusy?' disabled':''}>${S.aBusy?'...':(reg?'Create account':'Sign in')}</button>
+    ${reg?``:`<button onclick="W.fpStart()" style="background:transparent;border:none;color:#6b6a69;font-size:.82rem;text-decoration:underline;padding:2px">Forgot password?</button>`}
   </div></div></div>`;
 }
 window.W={};
-W.aMode=m=>{S.aMode=m;render();};
-W.fpStart=()=>{S.fpMode=true;S.fpMsg='';render();};
-W.fpBack=()=>{S.fpMode=false;render();};
-W.fpSub=async()=>{const e=(document.getElementById('fpe')?.value||'').trim().toLowerCase();if(!e)return;const a=await fGet('accounts');const f=a&&Object.entries(a).find(([,v])=>v.email===e);S.fpMsg=f?`Your username is: "${f[0]}"`:'No account found with that email.';render();};
+W.aMode=m=>{S.aMode=m;S.aErr='';render();};
+W.fpStart=()=>{S.fpMode=true;S.fpMsg='';S.fpErr='';render();};
+W.fpBack=()=>{S.fpMode=false;S.fpErr='';render();};
+
+W.fpSub=async()=>{
+  const e=(document.getElementById('fpe')?.value||'').trim().toLowerCase();
+  S.fpEmail=e;S.fpMsg='';S.fpErr='';
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)){S.fpErr='Invalid email.';render();return;}
+  S.aBusy=true;render();
+  try{
+    await sendPasswordResetEmail(auth,e);
+    // Firebase does not reveal whether the address exists — keep the wording neutral.
+    S.fpMsg='If an account exists for that email, a reset link is on its way. Check your spam folder too.';
+  }catch(err){S.fpErr=authErr(err);}
+  S.aBusy=false;render();
+};
+
 W.auth=async()=>{
   const u=(document.getElementById('au')?.value||'').trim().toLowerCase();
   const e=(document.getElementById('ae')?.value||'').trim().toLowerCase();
-  const p=(document.getElementById('ap')?.value||'').trim();
-  S.aUser=u;S.aEmail=e;
-  if(!u||!e||!p){S.aErr='All fields required.';render();return;}
-  if(!/^[a-z0-9_]{2,20}$/.test(u)){S.aErr='Username: 2-20 chars (a-z, 0-9, _)';render();return;}
+  const p=document.getElementById('ap')?.value||'';
+  const reg=S.aMode==='register';
+  S.aUser=u;S.aEmail=e;S.aErr='';
+  if(!e||!p||(reg&&!u)){S.aErr='All fields required.';render();return;}
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)){S.aErr='Invalid email.';render();return;}
-  if(S.aMode==='register'){
-    if(await fGet(`accounts/${u}`)){S.aErr='Username taken.';render();return;}
-    const accs=await fGet('accounts');if(accs&&Object.values(accs).some(a=>a.email===e)){S.aErr='Email already registered.';render();return;}
-    await fSet(`accounts/${u}`,{pw:p,email:e});
-    await fSet(`players/${u}`,{elo:1000,joined:Date.now(),nationality:'',club:'',eloHistory:[{elo:1000,ts:Date.now()}]});
-  }else{
-    const acc=await fGet(`accounts/${u}`);
-    if(!acc){S.aErr='Username not found.';render();return;}
-    if(acc.pw!==p){S.aErr='Wrong password.';render();return;}
-    if(!await fGet(`players/${u}`))await fSet(`players/${u}`,{elo:1000,joined:Date.now(),nationality:'',club:'',eloHistory:[{elo:1000,ts:Date.now()}]});
+  if(reg&&!NAME_RE.test(u)){S.aErr='Username: 2-20 chars (a-z, 0-9, _)';render();return;}
+  if(reg&&p.length<6){S.aErr='Password must be at least 6 characters.';render();return;}
+  S.aBusy=true;render();
+  try{
+    if(reg){
+      if(await fGet(`usernames/${u}`)){S.aErr='That username is taken.';S.aBusy=false;render();return;}
+      regInProgress=true;
+      const cred=await createUserWithEmailAndPassword(auth,e,p);
+      const err=await claimUsername(cred.user.uid,u);
+      regInProgress=false;
+      if(err){S.uid=cred.user.uid;S.pickErr=err;S.aBusy=false;S.screen='pickname';render();return;}
+      S.aBusy=false;await resolveUser(cred.user);
+    }else{
+      const cred=await signInWithEmailAndPassword(auth,e,p);
+      S.aBusy=false;await resolveUser(cred.user);
+    }
+  }catch(err){
+    regInProgress=false;
+    S.aErr=authErr(err);S.aBusy=false;render();
   }
-  S.user=u;S.aErr='';saveSession(u,p);startLobby();
 };
+
+W.pickName=async()=>{
+  const n=(document.getElementById('pkn')?.value||'').trim().toLowerCase();
+  const user=auth.currentUser;
+  if(!user){S.screen='auth';render();return;}
+  S.pickErr='';S.aBusy=true;render();
+  const err=await claimUsername(user.uid,n);
+  S.aBusy=false;
+  if(err){S.pickErr=err;render();return;}
+  await resolveUser(user);
+};
+
+/* Single entry point: whatever Firebase says about the session decides the screen. */
+let regInProgress=false,resolving=false;
+async function resolveUser(fbUser){
+  if(!fbUser){S.user=null;S.uid=null;S.screen='auth';render();return;}
+  if(resolving)return;
+  resolving=true;
+  try{
+    S.uid=fbUser.uid;
+    const name=await fGet(`uidNames/${fbUser.uid}`);
+    if(!name){S.screen='pickname';render();return;}
+    S.user=name;S.aErr='';
+    await ensurePlayer(name,fbUser.uid);
+    startLobby();
+  }finally{resolving=false;}
+}
 
 /* ═══ LOBBY ═══ */
 function startLobby(){
@@ -394,7 +525,7 @@ W.accept=async id=>{
   enterGame(id,game);
 };
 W.decline=async id=>{const ch=S.inChalls.find(c=>c.id===id);if(ch)await fSet(`challenges/${id}`,{...ch,status:'declined'});};
-W.logout=async()=>{clearInterval(hbId);unsub();await fSet(`presence/${S.user}`,{ts:0,status:'offline'});S.user=null;clearSession();S.screen='auth';render();};
+W.logout=async()=>{clearInterval(hbId);unsub();if(S.user)await fSet(`presence/${S.user}`,{ts:0,status:'offline'});S.user=null;S.uid=null;try{await signOut(auth);}catch{}S.screen='auth';render();};
 
 /* ═══ PROFILE ═══ */
 W.openProf=async name=>{S.profileTarget=name;S.profileData=null;S.profileGames=[];S.profileTab='stats';S.screen='profile';render();const[pd,pg]=await Promise.all([fGet(`players/${name}`),fGet(`playerGames/${name}`)]);S.profileData=pd||{elo:1000};S.profileGames=pg?Object.values(pg).sort((a,b)=>b.ts-a.ts):[];if(S.screen==='profile')render();};
@@ -638,11 +769,10 @@ clockId=setInterval(()=>{
 
 /* ═══ INIT ═══ */
 initDrag();
-(async()=>{
-  const sess=loadSession();
-  if(sess){const acc=await fGet(`accounts/${sess.u}`);if(acc&&acc.pw===sess.p){S.user=sess.u;startLobby();return;}else clearSession();}
-  render();
-})();
+purgeLegacySession();
+render();
+// Firebase restores the session itself; this fires once on load and on every sign-in/out.
+onAuthStateChanged(auth,u=>{if(regInProgress)return;resolveUser(u);});
 </script>
 </body>
   
